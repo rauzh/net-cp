@@ -1,19 +1,29 @@
 #include "http_handler.h"
 
-int handle_client(int client_socket) {
+void read_request(struct client_req* req) {
+
+    req->state = STATE_READ;
+
     char buffer[1024];
     char method[10], path[PATH_MAX], protocol[10];
 
-    if (recv(client_socket, buffer, sizeof(buffer), 0) <= 0) {
-        perror("Receive failed\n");
-        return -1;
+    int rcvd = recv(req->socket, buffer, sizeof(buffer), 0);
+    if(rcvd == -1) {
+        req->err_code = errno;
+        req->state = STATE_ERROR;
+        return;
+    }
+    if(rcvd == 0) { 
+        req->state = STATE_COMPLETE;
+        return;
     }
 
     sscanf(buffer, "%s %s %s", method, path, protocol);
 
     if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
-        send_error(client_socket, METHOD_NOT_ALLOWED);
-        return -1;
+        send_error(req->socket, METHOD_NOT_ALLOWED);
+        req->state = STATE_COMPLETE;
+        return;
     }
 
     char full_path[PATH_MAX];
@@ -22,12 +32,14 @@ int handle_client(int client_socket) {
     // Защита от несанкционированного доступа
     char resolved_path[PATH_MAX];
     if (realpath(full_path, resolved_path) == NULL) {
-        send_error(client_socket, NOT_FOUND);
-        return -1;
+        send_error(req->socket, NOT_FOUND);
+        req->state = STATE_COMPLETE;
+        return;
     }
     if (strncmp(resolved_path, STATIC_ROOT, strlen(STATIC_ROOT)) != 0) {
-        send_error(client_socket, FORBIDDEN);
-        return -1;
+        send_error(req->socket, FORBIDDEN);
+        req->state = STATE_COMPLETE;
+        return;
     }
 
     if (strcmp(path, "/") == 0) {
@@ -37,13 +49,101 @@ int handle_client(int client_socket) {
     // Если это директория, отправляем список файлов и поддиректорий
     if (stat(full_path, &path_stat) == 0 && S_ISDIR(path_stat.st_mode)) {
         if (path[strlen(path) - 1] != '/') { strcat(path, "/"); } // чек на слеш в конце урла
-        send_directory_listing(client_socket, path, full_path);
-        return 0;
+        send_directory_listing(req->socket, path, full_path);
+        req->state = STATE_COMPLETE;
+        return;
     }
 
-    send_file(client_socket, full_path, method);
+    int fd = open(full_path, O_RDONLY);
+    if (fd == -1) {
+        send_error(req->socket, NOT_FOUND);
+        req->state = STATE_COMPLETE;
+        return;
+    }
 
-    return 0;
+    flock(fd, LOCK_EX);
+
+    char *filebuff;
+    filebuff = malloc(path_stat.st_size);
+
+    int bytesRead = read(fd, filebuff, path_stat.st_size);
+    close(fd);
+
+    char headers[1024];
+    sprintf(headers, "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\n", path_stat.st_size);
+
+    // Определение Content-Type на основе расширения файла
+    const char* content_type = "text/plain";
+    const char* file_ext = strrchr(full_path, '.');
+    if (file_ext != NULL) {
+        if (strcmp(file_ext, ".html") == 0) {
+            content_type = "text/html";
+        }
+        else if (strcmp(file_ext, ".css") == 0) {
+            content_type = "text/css";
+        }
+        else if (strcmp(file_ext, ".js") == 0) {
+            content_type = "application/javascript";
+        }
+        else if (strcmp(file_ext, ".png") == 0) {
+            content_type = "image/png";
+        }
+        else if (strcmp(file_ext, ".jpg") == 0 || strcmp(file_ext, ".jpeg") == 0) {
+            content_type = "image/jpeg";
+        }
+        else if (strcmp(file_ext, ".swf") == 0) {
+            content_type = "application/x-shockwave-flash";
+        }
+        else if (strcmp(file_ext, ".gif") == 0) {
+            content_type = "image/gif";
+        }
+    }
+
+    sprintf(headers + strlen(headers), "Content-Type: %s\r\n\r\n", content_type);
+
+    // Отправка заголовков
+    send(req->socket, headers, strlen(headers), 0);
+
+    if (strcmp(method, "HEAD") == 0) {
+        close(fd);
+        req->state = STATE_COMPLETE;
+        flock(fd, LOCK_UN);
+        free(filebuff);
+        return;
+    }
+
+    req->write_buf->data = filebuff;
+    req->write_buf->size = bytesRead;
+    req->write_buf->bytes_written = 0;
+    
+    flock(fd, LOCK_UN);
+
+    send_response(req);
+
+    // send_file(req->socket, full_path, method);
+}
+
+void send_response(struct client_req* req) {
+
+    req->state = STATE_SEND;
+
+    int len = send(req->socket, req->write_buf->data + req->write_buf->bytes_written, req->write_buf->size, 0);
+
+    if(len == -1) { // Socket Error!!!
+        req->err_code = errno;
+        if(errno == EAGAIN || errno == EWOULDBLOCK) return;
+        req->state = STATE_ERROR;
+        free(req->write_buf->data);
+        return;
+    }
+    if(len > 0) {
+        req->write_buf->bytes_written += len;
+        req->write_buf->size -= len;
+        if(req->write_buf->size == 0) {
+            req->state = STATE_COMPLETE;
+            free(req->write_buf->data);
+        }
+    }
 }
 
 void send_directory_listing(int client_socket, const char* current_path, const char* directory_path) {
@@ -81,177 +181,6 @@ void send_directory_listing(int client_socket, const char* current_path, const c
     send(client_socket, buffer, strlen(buffer), 0);
 
     closedir(directory);
-}
-
-// void send_file(int client_socket, const char* file_path, const char* method) {
-//     FILE* file = fopen(file_path, "rb");
-//     if (file == NULL) {
-//         send_error(client_socket, NOT_FOUND);
-//         return;
-//     }
-
-//     // Блокировка файла
-//     int file_fd = fileno(file);
-//     if (flock(file_fd, LOCK_EX) != 0) {
-//         perror("Failed to lock file");
-//         send_error(client_socket, NOT_FOUND);
-//         fclose(file);
-//         return;
-//     }
-
-//     // Получение размера файла
-//     fseek(file, 0, SEEK_END);
-//     long file_size = ftell(file);
-//     fseek(file, 0, SEEK_SET);
-
-//     // Подготовка заголовков ответа
-//     char headers[1024];
-//     sprintf(headers, "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\n", file_size);
-
-//     // Определение Content-Type на основе расширения файла
-//     const char* content_type = "text/plain";
-//     const char* file_ext = strrchr(file_path, '.');
-//     if (file_ext != NULL) {
-//         if (strcmp(file_ext, ".html") == 0) {
-//             content_type = "text/html";
-//         }
-//         else if (strcmp(file_ext, ".css") == 0) {
-//             content_type = "text/css";
-//         }
-//         else if (strcmp(file_ext, ".js") == 0) {
-//             content_type = "application/javascript";
-//         }
-//         else if (strcmp(file_ext, ".png") == 0) {
-//             content_type = "image/png";
-//         }
-//         else if (strcmp(file_ext, ".jpg") == 0 || strcmp(file_ext, ".jpeg") == 0) {
-//             content_type = "image/jpeg";
-//         }
-//         else if (strcmp(file_ext, ".swf") == 0) {
-//             content_type = "application/x-shockwave-flash";
-//         }
-//         else if (strcmp(file_ext, ".gif") == 0) {
-//             content_type = "image/gif";
-//         }
-//     }
-
-//     sprintf(headers + strlen(headers), "Content-Type: %s\r\n\r\n", content_type);
-
-//     // Отправка заголовков
-//     send(client_socket, headers, strlen(headers), 0);
-
-//     if (strcmp(method, "HEAD") == 0) {
-//         fclose(file);
-//         flock(file_fd, LOCK_UN); // Снятие блокировки
-//         return;
-//     }
-
-//     // Отправка содержимого файла
-//     char buffer[65536];
-//     size_t bytes_read;
-//     while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
-//         send(client_socket, buffer, bytes_read, 0);
-//     }
-
-//     fclose(file);
-//     flock(file_fd, LOCK_UN); // Снятие блокировки
-// }
-
-static int poll_and_send(int client_socket, const char* data, size_t data_size) {
-    size_t total_sent = 0;
-
-    while (total_sent < data_size) {
-        // Настраиваем poll для проверки записи
-        struct pollfd pfd;
-        pfd.fd = client_socket;
-        pfd.events = POLLOUT;
- 
-        int poll_res = poll(&pfd, 1, 5000); // Таймаут 5 секунд
-        if (poll_res < 0) {
-            perror("poll failed");
-            return -1;
-        } else if (poll_res == 0) {
-            fprintf(stderr, "poll timed out\n");
-            return -1;
-        }
-
-        // Проверяем готовность сокета для записи
-        if (pfd.revents & POLLOUT) {
-            ssize_t bytes_sent = send(client_socket, data + total_sent, data_size - total_sent, 0);
-            if (bytes_sent < 0) {
-                perror("send failed");
-                return -1;
-            }
-            total_sent += bytes_sent;
-        }
-    }
-
-    return 0;
-}
-
-void send_file(int client_socket, const char* file_path, const char* method) {
-    FILE* file = fopen(file_path, "rb");
-    if (file == NULL) {
-        send_error(client_socket, NOT_FOUND);
-        return;
-    }
-
-    // Блокировка файла
-    int file_fd = fileno(file);
-    if (flock(file_fd, LOCK_EX) != 0) {
-        perror("Failed to lock file");
-        send_error(client_socket, NOT_FOUND);
-        fclose(file);
-        return;
-    }
-
-    // Получение размера файла
-    fseek(file, 0, SEEK_END);
-    long file_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-
-    // Подготовка заголовков ответа
-    char headers[1024];
-    sprintf(headers, "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\n", file_size);
-
-    // Определение Content-Type
-    const char* content_type = "text/plain";
-    const char* file_ext = strrchr(file_path, '.');
-    if (file_ext != NULL) {
-        if (strcmp(file_ext, ".html") == 0) content_type = "text/html";
-        else if (strcmp(file_ext, ".css") == 0) content_type = "text/css";
-        else if (strcmp(file_ext, ".js") == 0) content_type = "application/javascript";
-        else if (strcmp(file_ext, ".png") == 0) content_type = "image/png";
-        else if (strcmp(file_ext, ".jpg") == 0 || strcmp(file_ext, ".jpeg") == 0) content_type = "image/jpeg";
-        else if (strcmp(file_ext, ".gif") == 0) content_type = "image/gif";
-    }
-
-    sprintf(headers + strlen(headers), "Content-Type: %s\r\n\r\n", content_type);
-
-    // Отправка заголовков
-    if (poll_and_send(client_socket, headers, strlen(headers)) < 0) {
-        fclose(file);
-        flock(file_fd, LOCK_UN); // Снятие блокировки
-        return;
-    }
-
-    if (strcmp(method, "HEAD") == 0) {
-        fclose(file);
-        flock(file_fd, LOCK_UN); // Снятие блокировки
-        return;
-    }
-
-    // Отправка содержимого файла по частям
-    char buffer[65536];
-    size_t bytes_read;
-    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
-        if (poll_and_send(client_socket, buffer, bytes_read) < 0) {
-            break; // Ошибка при отправке
-        }
-    }
-
-    fclose(file);
-    flock(file_fd, LOCK_UN); // Снятие блокировки
 }
 
 void send_error(int client_socket, int status_code) {

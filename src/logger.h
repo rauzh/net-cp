@@ -12,7 +12,7 @@ typedef enum {
     LOG_ERROR
 } LogLevel;
 
-#define LOG_LEVEL   LOG_DEBUG
+#define LOG_LEVEL   LOG_INFO
 #define LOG_FILE    "logs/server_log.txt"
 
 void log_message(LogLevel level, const char* format, ...);

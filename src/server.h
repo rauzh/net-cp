@@ -28,7 +28,6 @@ struct settings {
     uint32_t addr;
     uint16_t port;
     uint16_t workers_num;
-    uint32_t max_clients;
     uint16_t max_conn;
 };
 
@@ -38,7 +37,6 @@ struct server {
     uint8_t _workers_num;
     uint16_t _max_conn;
 };
-
 
 void server_serve(struct server* srv);
 void server_shutdown(struct server* srv);
