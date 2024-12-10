@@ -105,7 +105,7 @@ static void _worker(struct server* srv, int worker_number) {
                     nfds++;
 
                     reqs[cur_req_idx].socket = client_socket;
-                    reqs[cur_req_idx].state = STATE_CONNECT;
+                    reqs[cur_req_idx].state = STATE_CONNECTED;
 
                     while (reqs[cur_req_idx].socket != -1) cur_req_idx = (cur_req_idx + 1) % (srv->_max_conn / srv->_workers_num);
                 } else {
@@ -126,13 +126,10 @@ static void _worker(struct server* srv, int worker_number) {
             }
 
             switch (req->state) { // свитч по состоянию
-                case STATE_CONNECT:
+                case STATE_CONNECTED:
                     read_request(req);
                     break;
-                case STATE_READ:
-                    read_request(req);
-                    break;
-                case STATE_SEND:
+                case STATE_SENDFILE:
                     send_response(req);
                     break;
             }
@@ -256,6 +253,7 @@ void server_serve(struct server* srv) {
 void server_shutdown(struct server* srv) {
     log_message(LOG_INFO, "Shutting down server...\n");
 
+    shutdown(srv->socket, SHUT_RDWR);
     close(srv->socket);
     free(srv);
 }

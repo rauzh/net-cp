@@ -1,131 +1,149 @@
 #include "http_handler.h"
 
-void read_request(struct client_req* req) {
-
-    req->state = STATE_READ;
-
-    char buffer[1024];
-    char method[10], path[PATH_MAX], protocol[10];
-
-    int rcvd = recv(req->socket, buffer, sizeof(buffer), 0);
-    if(rcvd == -1) {
+static bool handle_recv_error(struct client_req* req, int rcvd) {
+    if (rcvd == -1) {
         req->err_code = errno;
         req->state = STATE_ERROR;
-        return;
+        return true;
     }
-    if(rcvd == 0) { 
+    if (rcvd == 0) {
         req->state = STATE_COMPLETE;
-        return;
+        return true;
     }
+    return false;
+}
 
-    sscanf(buffer, "%s %s %s", method, path, protocol);
+static bool parse_request_line(const char* buffer, char* method, char* path, char* protocol) {
+    return sscanf(buffer, "%s %s %s", method, path, protocol) == 3;
+}
 
-    if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
-        send_error(req->socket, METHOD_NOT_ALLOWED);
-        req->state = STATE_COMPLETE;
-        return;
-    }
+static const char* get_content_type(const char* full_path) {
+    const char* file_ext = strrchr(full_path, '.');
+    if (!file_ext) return "text/plain";
 
-    char full_path[PATH_MAX];
-    sprintf(full_path, "%s%s", STATIC_ROOT, path);
+    if (strcmp(file_ext, ".html") == 0) return "text/html";
+    if (strcmp(file_ext, ".css") == 0) return "text/css";
+    if (strcmp(file_ext, ".js") == 0) return "application/javascript";
+    if (strcmp(file_ext, ".png") == 0) return "image/png";
+    if (strcmp(file_ext, ".jpg") == 0 || strcmp(file_ext, ".jpeg") == 0) return "image/jpeg";
+    if (strcmp(file_ext, ".gif") == 0) return "image/gif";
+    return "text/plain";
+}
 
-    // Защита от несанкционированного доступа
-    char resolved_path[PATH_MAX];
-    if (realpath(full_path, resolved_path) == NULL) {
-        send_error(req->socket, NOT_FOUND);
-        req->state = STATE_COMPLETE;
-        return;
-    }
-    if (strncmp(resolved_path, STATIC_ROOT, strlen(STATIC_ROOT)) != 0) {
-        send_error(req->socket, FORBIDDEN);
-        req->state = STATE_COMPLETE;
-        return;
-    }
+static void prepare_headers(char* headers, size_t size, off_t file_size, const char* full_path) {
+    sprintf(headers, "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\n", file_size);
 
-    if (strcmp(path, "/") == 0) {
-        strcat(full_path, "index.html");
-    }
+    const char* content_type = get_content_type(full_path);
+    sprintf(headers + strlen(headers), "Content-Type: %s\r\n\r\n", content_type);
+}
+
+static bool handle_file_request(struct client_req* req, const char* method, char* full_path) {
     struct stat path_stat;
-    // Если это директория, отправляем список файлов и поддиректорий
-    if (stat(full_path, &path_stat) == 0 && S_ISDIR(path_stat.st_mode)) {
-        if (path[strlen(path) - 1] != '/') { strcat(path, "/"); } // чек на слеш в конце урла
-        send_directory_listing(req->socket, path, full_path);
-        req->state = STATE_COMPLETE;
-        return;
-    }
+    if (stat(full_path, &path_stat) != 0 || !S_ISREG(path_stat.st_mode)) return false;
 
     int fd = open(full_path, O_RDONLY);
-    if (fd == -1) {
-        send_error(req->socket, NOT_FOUND);
-        req->state = STATE_COMPLETE;
-        return;
-    }
+    if (fd == -1) return false;
 
     flock(fd, LOCK_EX);
 
-    char *filebuff;
-    filebuff = malloc(path_stat.st_size);
-
+    char* filebuff = malloc(path_stat.st_size);
     int bytesRead = read(fd, filebuff, path_stat.st_size);
     close(fd);
 
     char headers[1024];
-    sprintf(headers, "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\n", path_stat.st_size);
+    prepare_headers(headers, sizeof(headers), path_stat.st_size, full_path);
 
-    // Определение Content-Type на основе расширения файла
-    const char* content_type = "text/plain";
-    const char* file_ext = strrchr(full_path, '.');
-    if (file_ext != NULL) {
-        if (strcmp(file_ext, ".html") == 0) {
-            content_type = "text/html";
-        }
-        else if (strcmp(file_ext, ".css") == 0) {
-            content_type = "text/css";
-        }
-        else if (strcmp(file_ext, ".js") == 0) {
-            content_type = "application/javascript";
-        }
-        else if (strcmp(file_ext, ".png") == 0) {
-            content_type = "image/png";
-        }
-        else if (strcmp(file_ext, ".jpg") == 0 || strcmp(file_ext, ".jpeg") == 0) {
-            content_type = "image/jpeg";
-        }
-        else if (strcmp(file_ext, ".swf") == 0) {
-            content_type = "application/x-shockwave-flash";
-        }
-        else if (strcmp(file_ext, ".gif") == 0) {
-            content_type = "image/gif";
-        }
-    }
-
-    sprintf(headers + strlen(headers), "Content-Type: %s\r\n\r\n", content_type);
-
-    // Отправка заголовков
     send(req->socket, headers, strlen(headers), 0);
 
     if (strcmp(method, "HEAD") == 0) {
-        close(fd);
         req->state = STATE_COMPLETE;
         flock(fd, LOCK_UN);
         free(filebuff);
-        return;
+        return true;
     }
 
     req->write_buf->data = filebuff;
     req->write_buf->size = bytesRead;
     req->write_buf->bytes_written = 0;
-    
+
     flock(fd, LOCK_UN);
-
     send_response(req);
+    return true;
+}
 
-    // send_file(req->socket, full_path, method);
+static void handle_directory_request(struct client_req* req, const char* path, const char* full_path) {
+    char adjusted_path[PATH_MAX];
+    strcpy(adjusted_path, path);
+    if (path[strlen(path) - 1] != '/') {
+        strcat(adjusted_path, "/");
+    }
+    send_directory_listing(req->socket, adjusted_path, full_path);
+    req->state = STATE_COMPLETE;
+}
+
+static void handle_resource_request(struct client_req* req, const char* method, const char* path, char* full_path) {
+    struct stat path_stat;
+    if (stat(full_path, &path_stat) == 0 && S_ISDIR(path_stat.st_mode)) {
+        handle_directory_request(req, path, full_path);
+        return;
+    }
+
+    if (!handle_file_request(req, method, full_path)) {
+        send_error(req->socket, NOT_FOUND);
+        req->state = STATE_COMPLETE;
+    }
+}
+
+static bool resolve_full_path(struct client_req* req, const char* path, char* full_path) {
+    sprintf(full_path, "%s%s", STATIC_ROOT, path);
+
+    char resolved_path[PATH_MAX];
+    if (realpath(full_path, resolved_path) == NULL) {
+        send_error(req->socket, NOT_FOUND);
+        req->state = STATE_COMPLETE;
+        return false;
+    }
+    if (strncmp(resolved_path, STATIC_ROOT, strlen(STATIC_ROOT)) != 0) {
+        send_error(req->socket, FORBIDDEN);
+        req->state = STATE_COMPLETE;
+        return false;
+    }
+    return true;
+}
+
+static bool validate_method(struct client_req* req, const char* method) {
+    if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
+        send_error(req->socket, METHOD_NOT_ALLOWED);
+        req->state = STATE_COMPLETE;
+        return false;
+    }
+    return true;
+}
+
+void read_request(struct client_req* req) {
+
+    char buffer[1024];
+    int rcvd = recv(req->socket, buffer, sizeof(buffer), 0);
+    if (handle_recv_error(req, rcvd)) return;
+
+    char method[10], path[PATH_MAX], protocol[10];
+    if (!parse_request_line(buffer, method, path, protocol)) {
+        send_error(req->socket, BAD_REQUEST);
+        req->state = STATE_COMPLETE;
+        return;
+    }
+
+    if (!validate_method(req, method)) return;
+
+    char full_path[PATH_MAX];
+    if (!resolve_full_path(req, path, full_path)) return;
+
+    handle_resource_request(req, method, path, full_path);
 }
 
 void send_response(struct client_req* req) {
 
-    req->state = STATE_SEND;
+    req->state = STATE_SENDFILE;
 
     int len = send(req->socket, req->write_buf->data + req->write_buf->bytes_written, req->write_buf->size, 0);
 

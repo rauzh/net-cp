@@ -4,6 +4,7 @@
 #include <sys/socket.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <limits.h>
 #include <unistd.h>
@@ -25,8 +26,7 @@
 #define STATIC_ROOT             "/Users/rauzh/Desktop/study/net/static"
 
 enum req_state {
-    STATE_CONNECT, STATE_READ, 
-    STATE_INDENTIFY, STATE_SEND,
+    STATE_CONNECTED, STATE_SENDFILE,
     STATE_COMPLETE, STATE_ERROR
 };
 
