@@ -39,7 +39,7 @@ static void __set_sig_handler_main() {
 }
 
 static struct pollfd* __worker_init_poll_fds(struct server*  srv) {
-    struct pollfd *poll_fds = calloc((srv->_max_conn), sizeof(struct pollfd));
+    struct pollfd *poll_fds = calloc((srv->_max_conn / srv->_workers_num) + 1, sizeof(struct pollfd));
     poll_fds[0].fd = srv->socket;
     poll_fds[0].events = POLLIN;
 

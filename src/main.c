@@ -3,7 +3,7 @@
 
 int main(void) {
 
-    struct settings server_settings = {INADDR_ANY, PORT, 8, 16384};
+    struct settings server_settings = {INADDR_ANY, PORT, 2, 16384};
 
     struct server* srv = server_init(&server_settings);
 

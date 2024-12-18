@@ -40,7 +40,6 @@ struct client_req {
     int      socket;
     uint8_t  state;
     struct write_buffer* write_buf;
-    int      err_code;
 };
 
 void send_directory_listing(int client_socket, const char* current_path, const char* directory_path);

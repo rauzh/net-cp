@@ -2,7 +2,6 @@
 
 static bool handle_recv_error(struct client_req* req, int rcvd) {
     if (rcvd == -1) {
-        req->err_code = errno;
         req->state = STATE_ERROR;
         return true;
     }
@@ -148,7 +147,6 @@ void send_response(struct client_req* req) {
     int len = send(req->socket, req->write_buf->data + req->write_buf->bytes_written, req->write_buf->size, 0);
 
     if(len == -1) { // Socket Error!!!
-        req->err_code = errno;
         if(errno == EAGAIN || errno == EWOULDBLOCK) return;
         req->state = STATE_ERROR;
         free(req->write_buf->data);
